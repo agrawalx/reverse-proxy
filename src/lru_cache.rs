@@ -88,9 +88,9 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
                 let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
                 unsafe {
                     // need to drop the value before assigning new value otherwise we have memory leak
-                    (*node.as_mut()).value.assume_init_drop();
-                    (*node.as_mut()).value = MaybeUninit::new(v);
-                    (*node.as_mut()).expiry = Instant::now() + ttl;
+                    (*node_ptr).value.assume_init_drop();
+                    (*node_ptr).value = MaybeUninit::new(v);
+                    (*node_ptr).expiry = Instant::now() + ttl;
                 }
                 self.detach(node_ptr);
                 self.attach(node_ptr)
@@ -98,9 +98,9 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
             }
             // node does not exist
             None => {
-                let mut node = Box::new(LruEntry::new(k, v, ttl));
+                let node = Box::new(LruEntry::new(k, v, ttl));
                 // reference to the node 
-                let node_ptr: *mut LruEntry<K,V> = &mut *node ;
+                let node_ptr = Box::into_raw(node);
                 self.attach(node_ptr);
                 let key_ptr = unsafe {(*node_ptr).key.as_ptr()}; 
 
@@ -109,8 +109,6 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
                     NonNull::new(node_ptr).unwrap()
                 );
                 // without this, box gets dropped and our node_ptr becomes a dangling pointer
-                mem::forget(node);
-
                 if self.len() > self.capacity() {
                     self.remove_lru();
                 }
