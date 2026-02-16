@@ -7,6 +7,7 @@ use std::ptr;
 use std::mem; 
 use std::mem::MaybeUninit;
 use std::time::{Duration, Instant};
+use std::fmt;
 
 struct KeyRef<K> { k: *const K }
 
@@ -57,7 +58,7 @@ impl<K, V> LruEntry<K, V> {
             value: mem::MaybeUninit::uninit(),
             prev: ptr::null_mut(),
             next: ptr::null_mut(),
-            expiry: Instant::now() + Duration::from_secs(u64::MAX / 2), // Far future
+            expiry: Instant::now(), // Sentinel nodes don't expire
         }
     }
 }
@@ -227,5 +228,208 @@ impl<K, V> Drop for LruCache<K, V> {
             let _ = *Box::from_raw(self.tail);
         }
     }
+}
+
+impl<K: Hash + Eq + fmt::Debug, V: fmt::Debug> fmt::Debug for LruCache<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LruCache")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn test_new_cache() {
+        let cache: LruCache<i32, String> = LruCache::new(NonZeroUsize::new(5).unwrap());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.capacity(), 5);
+    }
+
+    #[test]
+    fn test_put_and_get() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        cache.put(2, "two", ttl);
+        cache.put(3, "three", ttl);
+        
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&1), Some(&"one"));
+        assert_eq!(cache.get(&2), Some(&"two"));
+        assert_eq!(cache.get(&3), Some(&"three"));
+        assert_eq!(cache.get(&4), None);
+    }
+
+    #[test]
+    fn test_put_update_existing() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        cache.put(2, "two", ttl);
+        assert_eq!(cache.get(&1), Some(&"one"));
+        
+        // Update existing key
+        cache.put(1, "ONE", ttl);
+        assert_eq!(cache.get(&1), Some(&"ONE"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        cache.put(2, "two", ttl);
+        cache.put(3, "three", ttl);
+        
+        // Cache is full, adding one more should evict the least recently used (1)
+        cache.put(4, "four", ttl);
+        
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&1), None); // 1 was evicted
+        assert_eq!(cache.get(&2), Some(&"two"));
+        assert_eq!(cache.get(&3), Some(&"three"));
+        assert_eq!(cache.get(&4), Some(&"four"));
+    }
+
+    #[test]
+    fn test_lru_eviction_with_get() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        cache.put(2, "two", ttl);
+        cache.put(3, "three", ttl);
+        
+        // Access 1, making it most recently used
+        cache.get(&1);
+        
+        // Add new item, should evict 2 (least recently used)
+        cache.put(4, "four", ttl);
+        
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&1), Some(&"one")); // 1 still present
+        assert_eq!(cache.get(&2), None); // 2 was evicted
+        assert_eq!(cache.get(&3), Some(&"three"));
+        assert_eq!(cache.get(&4), Some(&"four"));
+    }
+
+    #[test]
+    fn test_ttl_expiration() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let short_ttl = Duration::from_millis(100);
+        let long_ttl = Duration::from_secs(60);
+        
+        cache.put(1, "expires", short_ttl);
+        cache.put(2, "persists", long_ttl);
+        
+        // Both should be accessible immediately
+        assert_eq!(cache.get(&1), Some(&"expires"));
+        assert_eq!(cache.get(&2), Some(&"persists"));
+        
+        // Wait for first entry to expire
+        thread::sleep(Duration::from_millis(150));
+        
+        // First entry should be gone, second should remain
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(&"persists"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_evict_expired() {
+        let mut cache = LruCache::new(NonZeroUsize::new(5).unwrap());
+        let short_ttl = Duration::from_millis(100);
+        let long_ttl = Duration::from_secs(60);
+        
+        cache.put(1, "expires1", short_ttl);
+        cache.put(2, "persists", long_ttl);
+        cache.put(3, "expires2", short_ttl);
+        cache.put(4, "expires3", short_ttl);
+        
+        assert_eq!(cache.len(), 4);
+        
+        // Wait for short TTL entries to expire
+        thread::sleep(Duration::from_millis(150));
+        
+        // Manually evict expired entries
+        let evicted = cache.evict_expired();
+        
+        assert_eq!(evicted, 3); // 3 entries expired
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&2), Some(&"persists"));
+    }
+
+    #[test]
+    fn test_update_refreshes_ttl() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let short_ttl = Duration::from_millis(100);
+        let long_ttl = Duration::from_secs(60);
+        
+        cache.put(1, "data", short_ttl);
+        
+        // Wait half the TTL
+        thread::sleep(Duration::from_millis(60));
+        
+        // Update with new TTL
+        cache.put(1, "updated", long_ttl);
+        
+        // Wait past the original TTL
+        thread::sleep(Duration::from_millis(60));
+        
+        // Should still be present with updated value
+        assert_eq!(cache.get(&1), Some(&"updated"));
+    }
+
+    #[test]
+    fn test_single_capacity_cache() {
+        let mut cache = LruCache::new(NonZeroUsize::new(1).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        assert_eq!(cache.get(&1), Some(&"one"));
+        assert_eq!(cache.len(), 1);
+        
+        cache.put(2, "two", ttl);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(&"two"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_string_keys_and_values() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put("key1".to_string(), "value1".to_string(), ttl);
+        cache.put("key2".to_string(), "value2".to_string(), ttl);
+        
+        assert_eq!(cache.get(&"key1".to_string()), Some(&"value1".to_string()));
+        assert_eq!(cache.get(&"key2".to_string()), Some(&"value2".to_string()));
+        assert_eq!(cache.get(&"key3".to_string()), None);
+    }
+
+    #[test]
+    fn test_evict_expired_no_expired_entries() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+        let ttl = Duration::from_secs(60);
+        
+        cache.put(1, "one", ttl);
+        cache.put(2, "two", ttl);
+        
+        let evicted = cache.evict_expired();
+        assert_eq!(evicted, 0);
+        assert_eq!(cache.len(), 2);
+    }
+
 }
 
