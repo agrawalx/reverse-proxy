@@ -108,7 +108,7 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
                     KeyRef { k: key_ptr },
                     NonNull::new(node_ptr).unwrap()
                 );
-                // without this, box gets dropped and our node_ptr becomes a dangling pointer
+                
                 if self.len() > self.capacity() {
                     self.remove_lru();
                 }
@@ -146,7 +146,12 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
             self.detach(lru); // removing the pointer to the node thats getting dropped
             let key_ptr = (*lru).key.as_ptr();
             self.map.remove(&KeyRef { k: key_ptr }); // removing the pointer from hashmap
-            drop(Box::from_raw(lru)); // no pointer to the node exists so we can drop it now. 
+            
+            // Manually drop MaybeUninit fields before dropping the box
+            let mut entry = Box::from_raw(lru);
+            ptr::drop_in_place(entry.key.as_mut_ptr());
+            ptr::drop_in_place(entry.value.as_mut_ptr());
+            drop(entry);
         }
     }
 
@@ -154,8 +159,8 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
         // lifetime of returned reference to value is tied to &mut self 
         // we cant use .map method of option since self.map.get_mut mutably borrows self and then detach/attach also mutably borrows self and we can't have multiple mutable borrows
         let node_ptr = match self.map.get_mut(&KeyRef { k: key }) {
-        Some(node) => node.as_ptr(),
-        None => return None,
+            Some(node) => node.as_ptr(),
+            None => return None,
         };
         // borrow of map ends here so we can again have mutable borrows to self
         unsafe {
@@ -165,7 +170,12 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
                 self.detach(node_ptr);
                 let key_ptr = (*node_ptr).key.as_ptr();
                 self.map.remove(&KeyRef { k: key_ptr });
-                drop(Box::from_raw(node_ptr));
+                
+                // Manually drop MaybeUninit fields before dropping the box
+                let mut entry = Box::from_raw(node_ptr);
+                ptr::drop_in_place(entry.key.as_mut_ptr());
+                ptr::drop_in_place(entry.value.as_mut_ptr());
+                drop(entry);
                 return None;
             }
             
@@ -196,7 +206,12 @@ impl <K: Hash + Eq,V> LruCache<K,V> {
                 self.detach(*node_ptr);
                 let key_ptr = (**node_ptr).key.as_ptr();
                 self.map.remove(&KeyRef { k: key_ptr });
-                drop(Box::from_raw(*node_ptr));
+                
+                // Manually drop MaybeUninit fields before dropping the box
+                let mut entry = Box::from_raw(*node_ptr);
+                ptr::drop_in_place(entry.key.as_mut_ptr());
+                ptr::drop_in_place(entry.value.as_mut_ptr());
+                drop(entry);
             }
         }
         
@@ -219,8 +234,9 @@ impl<K, V> Drop for LruCache<K, V> {
                 // Manually drop ONLY initialized fields
                 ptr::drop_in_place(entry.key.as_mut_ptr());
                 ptr::drop_in_place(entry.value.as_mut_ptr());
+                
             });
-
+            // dropping sentinel nodes without explicitly calling drop on key and value makes sure we dont drop uninit memory. 
             // Free sentinel nodes WITHOUT dropping fields
             let _ = *Box::from_raw(self.head);
             let _ = *Box::from_raw(self.tail);
