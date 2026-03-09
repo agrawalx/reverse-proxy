@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::num::NonZeroUsize;
-use hyper::header::HOST;
+use hyper::header::{HOST, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, body::Bytes};
@@ -10,8 +10,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
-use http_body_util::{BodyExt, Empty, Full};
-
+use http_body_util::{BodyExt, Full, StreamBody};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use hyper::body::Frame;
+use http_body_util::combinators::BoxBody;
 mod lru_cache;
 use lru_cache::LruCache;
 
@@ -52,7 +54,16 @@ async fn proxy_handler(
     req: Request<hyper::body::Incoming>,
     cache_tx: mpsc::Sender<CacheMessage>,
     client: HttpClient,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    client_ip: SocketAddr,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // responses > 10mb won't be cached 
+    const MAX_CACHE_SIZE: usize = 10 * 1024 * 1024;
+
+    let hop_headers = [
+        "connection", "keep-alive", "proxy-authenticate", 
+        "proxy-authorization", "te", "trailers", 
+        "transfer-encoding", "upgrade"
+    ];
     let method = req.method().as_str().to_owned();
     let host = req.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string(); 
     let path = req.uri().path().to_owned();
@@ -78,7 +89,7 @@ async fn proxy_handler(
         // 2. Wait for Cache Hit or Miss
         if let Ok(Some(cached_bytes)) = reply_rx.await {
             println!("Cache HIT: {:?}", cache_key);
-            return Ok(Response::new(Full::new(cached_bytes)));
+            return Ok(Response::new(Full::new(cached_bytes).map_err(|never| match never {}).boxed()));
         }
 
         println!("Cache MISS: {:?}", cache_key);
@@ -88,6 +99,7 @@ async fn proxy_handler(
 
     // 3. Forward to backend on Miss using hyper_util Client
     // Resolve the backend based on the requested host
+    
     let backend_base = resolve_backend(&host);
     let backend_uri = format!("{}{}", backend_base, req.uri().path_and_query().map(|x| x.as_str()).unwrap_or(""));
     let (parts, body) = req.into_parts();
@@ -98,35 +110,96 @@ async fn proxy_handler(
         .body(body)
         .unwrap();
 
-    // Copy original headers and remove Host (the backend expects its own host)
+    
+    // Copy original headers and remove Host, hop-by-hop headers(the backend expects its own host)
     *backend_req.headers_mut() = parts.headers;
+    // remove hop-by-hop headers 
+    for header in &hop_headers {
+        backend_req.headers_mut().remove(*header);
+    }
+
     backend_req.headers_mut().remove(hyper::header::HOST);
+
+    backend_req.headers_mut().insert(
+        "x-forwarded-for",
+        HeaderValue::from_str(&client_ip.ip().to_string()).unwrap()
+    );
 
     // Forward the request via pooled client
     let backend_res = match client.request(backend_req).await {
         Ok(res) => res,
         Err(err) => {
             eprintln!("Error connecting to backend: {}", err);
-            let mut res = Response::new(Full::new(Bytes::from("502 Bad Gateway\n")));
+            let mut res = Response::new(Full::new(Bytes::from("502 Bad Gateway\n")).map_err(|never| match never {}).boxed());
             *res.status_mut() = hyper::StatusCode::BAD_GATEWAY;
             return Ok(res);
         }
     };
-    
-    // Read the response body
-    let (parts, body) = backend_res.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
 
-    if can_cache {
-        // 4. Send Put message to map the URL to the new Body in our Cache Actor
-        let _ = cache_tx.send(CacheMessage::Put {
-            key: cache_key,
-            value: body_bytes.clone(),
-        }).await;
+    let (parts, mut body) = backend_res.into_parts();
+    let (tx, rx) = mpsc::channel(16);
+    // this is the stream that's passed to hyper which sends the bytes to client's socket 
+    let body_stream = ReceiverStream::new(rx).map(Ok::<_, hyper::Error>);
+    let response_body = StreamBody::new(body_stream).boxed();
+
+    // Clone things needed for the background task
+    let cache_tx_clone = cache_tx.clone();
+    let cache_key_clone = cache_key.clone();
+    let mut can_cache = can_cache;
+
+    // Detect size early if Content-Length exists
+    if let Some(cl) = parts.headers.get(hyper::header::CONTENT_LENGTH) {
+        if let Ok(len_str) = cl.to_str() {
+            if let Ok(len) = len_str.parse::<usize>() {
+                if len > MAX_CACHE_SIZE { can_cache = false; }
+            }
+        }
     }
+    // Read the response body & spawn a new background task to send response to client 
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let mut total_size = 0;
+        // here we are the acting as the client to the server. 
+        // we pull the data, forward it to the reciever channel and hyper automatically handles pulling that data through the response body that we have returned
+        while let Some(frame_result) = body.frame().await {
+            match frame_result {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref() {
+                        total_size += data.len();
+                        
+                        // 1. If still within limits, record for cache
+                        if can_cache && total_size <= MAX_CACHE_SIZE {
+                            buffer.extend_from_slice(data);
+                        } else {
+                            can_cache = false; // Exceeded limit, stop buffering
+                        }
 
-    // 5. Send backend body down to the user
-    let mut res = Response::new(Full::new(body_bytes));
+                        // 2. Forward chunk to client immediately
+                        if tx.send(Frame::data(data.clone())).await.is_err() {
+                            break; // Client disconnected
+                        }
+                    }
+                    // Handle trailers if any
+                    if let Some(trailers) = frame.trailers_ref() {
+                        let _ = tx.send(Frame::trailers(trailers.clone())).await;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // 3. If finished and still eligible, Put in Cache
+        if can_cache && total_size > 0 {
+            let _ = cache_tx_clone.send(CacheMessage::Put {
+                key: cache_key_clone,
+                value: Bytes::from(buffer),
+            }).await;
+        }
+    });
+
+    // 5. we return the response stream to the client with the status code. 
+    // now they listen for incoming stream and hyper automatically handles calling stream.next().await when we pipe body
+    let mut res = Response::new(response_body);
     *res.headers_mut() = parts.headers;
     *res.status_mut() = parts.status;
 
@@ -190,7 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build(connector); 
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, client_address) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let cache_tx_clone = cache_tx.clone();
         let client_clone = client.clone();
@@ -199,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(io, service_fn(move |req| {
-                    proxy_handler(req, cache_tx_clone.clone(), client_clone.clone())
+                    proxy_handler(req, cache_tx_clone.clone(), client_clone.clone(),client_address)
                 }))
                 .await
             {

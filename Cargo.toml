@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-stream = { version = "0.1.18"}
 hyper = { version = "1.5", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
