@@ -33,6 +33,8 @@ impl<K: Hash> Hash for KeyRef<K> {
     }
 }
 
+unsafe impl<K: Send> Send for KeyRef<K> {}
+
 impl<K: PartialEq> PartialEq for KeyRef<K> {
     fn eq(&self, other: &Self) -> bool {
         unsafe { *self.k == *other.k } // compare the values not address so we can't just derive these traits
@@ -243,6 +245,8 @@ impl<K, V> Drop for LruCache<K, V> {
         }
     }
 }
+
+unsafe impl<K: Send, V: Send> Send for LruCache<K, V> {}
 
 impl<K: Hash + Eq + fmt::Debug, V: fmt::Debug> fmt::Debug for LruCache<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
