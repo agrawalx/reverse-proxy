@@ -330,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Shutdown actors
     println!("Shutting down actors...");
+    // drops both the cleanup actors 
     let _ = shutdown_tx.send(());
     let _ = cache_tx.send(CacheMessage::Shutdown).await;
     let _ = rate_limit_tx.send(RateLimitMessage::Shutdown).await;
