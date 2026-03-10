@@ -53,22 +53,38 @@ pub enum RateLimitMessage {
         reply_to: oneshot::Sender<bool>,
     },
     CleanExpired,
+    Shutdown,
 }
 
-pub fn spawn_rate_limiter(capacity: f64, leak_rate: f64) -> mpsc::Sender<RateLimitMessage> {
+pub fn spawn_rate_limiter(
+    capacity: f64,
+    leak_rate: f64,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> (mpsc::Sender<RateLimitMessage>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<RateLimitMessage>(256);
 
     // Periodic cleanup task
     let tx_cleanup = tx.clone();
-    tokio::spawn(async move {
+    // basically clones the reciever end using a reciever 
+    let mut shutdown_rx_cleanup = shutdown_rx.resubscribe();
+    let cleanup_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
-            interval.tick().await;
-            let _ = tx_cleanup.send(RateLimitMessage::CleanExpired).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    if tx_cleanup.send(RateLimitMessage::CleanExpired).await.is_err() {
+                        break;
+                    }
+                }
+                _ = shutdown_rx_cleanup.recv() => {
+                    println!("Rate limiter cleanup task shutting down");
+                    break;
+                }
+            }
         }
     });
 
-    tokio::spawn(async move {
+    let main_handle = tokio::spawn(async move {
         let mut buckets: HashMap<IpAddr, LeakyBucket> = HashMap::new();
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -86,9 +102,15 @@ pub fn spawn_rate_limiter(capacity: f64, leak_rate: f64) -> mpsc::Sender<RateLim
                         println!("Rate limiter: removed {} idle buckets", removed);
                     }
                 }
+                RateLimitMessage::Shutdown => {
+                    println!("Rate limiter actor shutting down gracefully");
+                    break;
+                }
             }
         }
+        println!("Rate limiter actor terminated");
+        drop(cleanup_handle);
     });
 
-    tx
+    (tx, main_handle)
 }

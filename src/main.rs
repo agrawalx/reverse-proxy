@@ -216,12 +216,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     let listener = TcpListener::bind(addr).await?;
     println!("Reverse Proxy listening on http://{}", addr);
-    // creates the channel to communicate with cache actor
+    
+    // Creates the channel to communicate with cache actor
     let (cache_tx, cache_rx) = tokio::sync::mpsc::channel::<CacheMessage>(100);
+    
+    // Shutdown coordination using broadcast channel
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-    spawn_periodic_evictor(cache_tx.clone());
-    spawn_cache_actor(cache_rx);
-    // connection pooling(very imp since TLS handshakes are expensive)
+    let cache_handle = spawn_cache_actor(cache_rx);
+    let evictor_handle = spawn_periodic_evictor(cache_tx.clone(), shutdown_tx.subscribe());
+    
+    // Connection pooling (very imp since TLS handshakes are expensive)
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
     connector.set_keepalive(Some(Duration::from_secs(60)));
@@ -231,25 +236,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .pool_max_idle_per_host(32)
         .build(connector); 
 
-    let rate_limit_tx = spawn_rate_limiter(30.0, 5.0);
+    let (rate_limit_tx, rate_limit_handle) = spawn_rate_limiter(30.0, 5.0, shutdown_tx.subscribe());
 
-    loop {
-        let (stream, client_address) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let cache_tx_clone = cache_tx.clone();
-        let client_clone = client.clone();
-        let rate_limit_tx_clone = rate_limit_tx.clone();
-
-        // Spawn a tokio task to serve requests concurrently from this TCP stream (Keep-Alive)
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(move |req| {
-                    proxy_handler(req, cache_tx_clone.clone(), client_clone.clone(),client_address,rate_limit_tx_clone.clone())
-                }))
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
+    // Setup signal handling for graceful shutdown
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to setup SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("failed to setup SIGINT handler");
+            
+            tokio::select! {
+                _ = sigterm.recv() => println!("\nReceived SIGTERM"),
+                _ = sigint.recv() => println!("\nReceived SIGINT (Ctrl+C)"),
             }
-        });
+        }
+        
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("failed to setup Ctrl+C handler");
+            println!("\nReceived Ctrl+C");
+        }
+    };
+
+    // Track active connections
+    let (connection_tx, mut connection_rx) = mpsc::channel::<()>(1);
+    
+    println!("Server ready. Press Ctrl+C to shutdown gracefully.");
+
+    // Main accept loop with shutdown signal
+    tokio::select! {
+        _ = async {
+            loop {
+                let (stream, client_address) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        eprintln!("Failed to accept connection: {}", e);
+                        continue;
+                    }
+                };
+                
+                let io = TokioIo::new(stream);
+                let cache_tx_clone = cache_tx.clone();
+                let client_clone = client.clone();
+                let rate_limit_tx_clone = rate_limit_tx.clone();
+                let connection_tx_clone = connection_tx.clone();
+
+                // Spawn a tokio task to serve requests concurrently from this TCP stream (Keep-Alive)
+                tokio::task::spawn(async move {
+                    let _guard = connection_tx_clone; // Keeps channel open while connection is alive
+                    
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(io, service_fn(move |req| {
+                            proxy_handler(
+                                req,
+                                cache_tx_clone.clone(),
+                                client_clone.clone(),
+                                client_address,
+                                rate_limit_tx_clone.clone()
+                            )
+                        }))
+                        .await
+                    {
+                        eprintln!("Error serving connection: {:?}", err);
+                    }
+                });
+            }
+        } => {},
+        _ = shutdown_signal => {
+            println!("Shutdown signal received, starting graceful shutdown...");
+        }
     }
+
+    // Drop the original sender so we can detect when all connections are dropped
+    drop(connection_tx);
+    
+    // Stop accepting new connections
+    drop(listener);
+    println!("Stopped accepting new connections");
+
+    // Wait for active connections to finish (with timeout)
+    println!("Waiting for active connections to complete...");
+    tokio::select! {
+        // when all the connection_tx_clone finishes, the reciever gets a None 
+        _ = connection_rx.recv() => {
+            // Channel closed when all connection handles are dropped
+            println!("All connections closed");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            println!("Shutdown timeout reached, forcing shutdown");
+        }
+    }
+
+    // Shutdown actors
+    println!("Shutting down actors...");
+    let _ = shutdown_tx.send(());
+    let _ = cache_tx.send(CacheMessage::Shutdown).await;
+    let _ = rate_limit_tx.send(RateLimitMessage::Shutdown).await;
+
+    // Wait for actors to finish
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = tokio::join!(cache_handle, evictor_handle, rate_limit_handle);
+    }).await;
+
+    println!("Graceful shutdown complete");
+    Ok(())
 }

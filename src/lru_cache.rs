@@ -279,12 +279,13 @@ pub enum CacheMessage {
         value: Bytes,
     },
     EvictExpired,
+    Shutdown,
 }
 
 // ── Cache actors ─────────────────────────────────────────────────────────────
 
 /// Spawns the cache actor that owns the LRU map and handles Get/Put/EvictExpired messages.
-pub fn spawn_cache_actor(mut cache_rx: mpsc::Receiver<CacheMessage>) {
+pub fn spawn_cache_actor(mut cache_rx: mpsc::Receiver<CacheMessage>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let capacity = NonZeroUsize::new(1000).unwrap();
         let mut cache: LruCache<CacheKey, Bytes> = LruCache::new(capacity);
@@ -305,20 +306,37 @@ pub fn spawn_cache_actor(mut cache_rx: mpsc::Receiver<CacheMessage>) {
                         println!("Evicted {} expired cache entries", count);
                     }
                 }
+                CacheMessage::Shutdown => {
+                    println!("Cache actor shutting down gracefully");
+                    break;
+                }
             }
         }
-    });
+        println!("Cache actor terminated");
+    })
 }
 
 /// Spawns a task that sends `EvictExpired` to the cache actor every 60 seconds.
-pub fn spawn_periodic_evictor(cache_tx: mpsc::Sender<CacheMessage>) {
+pub fn spawn_periodic_evictor(
+    cache_tx: mpsc::Sender<CacheMessage>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
-            interval.tick().await;
-            let _ = cache_tx.send(CacheMessage::EvictExpired).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    if cache_tx.send(CacheMessage::EvictExpired).await.is_err() {
+                        break;
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    println!("Evictor task shutting down");
+                    break;
+                }
+            }
         }
-    });
+    })
 }
 
 #[cfg(test)]
