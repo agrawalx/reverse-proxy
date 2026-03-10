@@ -8,6 +8,8 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::time::{Duration, Instant};
 use std::fmt;
+use tokio::sync::{mpsc, oneshot};
+use hyper::body::Bytes;
 
 struct KeyRef<K> { k: *const K }
 
@@ -255,6 +257,68 @@ impl<K: Hash + Eq + fmt::Debug, V: fmt::Debug> fmt::Debug for LruCache<K, V> {
             .field("capacity", &self.capacity())
             .finish()
     }
+}
+
+// ── Cache domain types ───────────────────────────────────────────────────────
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct CacheKey {
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub query: Option<String>,
+}
+
+pub enum CacheMessage {
+    Get {
+        key: CacheKey,
+        reply_to: oneshot::Sender<Option<Bytes>>,
+    },
+    Put {
+        key: CacheKey,
+        value: Bytes,
+    },
+    EvictExpired,
+}
+
+// ── Cache actors ─────────────────────────────────────────────────────────────
+
+/// Spawns the cache actor that owns the LRU map and handles Get/Put/EvictExpired messages.
+pub fn spawn_cache_actor(mut cache_rx: mpsc::Receiver<CacheMessage>) {
+    tokio::spawn(async move {
+        let capacity = NonZeroUsize::new(1000).unwrap();
+        let mut cache: LruCache<CacheKey, Bytes> = LruCache::new(capacity);
+        let default_ttl = Duration::from_secs(60);
+
+        while let Some(msg) = cache_rx.recv().await {
+            match msg {
+                CacheMessage::Get { key, reply_to } => {
+                    let cached_value = cache.get(&key).cloned();
+                    let _ = reply_to.send(cached_value);
+                }
+                CacheMessage::Put { key, value } => {
+                    cache.put(key, value, default_ttl);
+                }
+                CacheMessage::EvictExpired => {
+                    let count = cache.evict_expired();
+                    if count > 0 {
+                        println!("Evicted {} expired cache entries", count);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawns a task that sends `EvictExpired` to the cache actor every 60 seconds.
+pub fn spawn_periodic_evictor(cache_tx: mpsc::Sender<CacheMessage>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let _ = cache_tx.send(CacheMessage::EvictExpired).await;
+        }
+    });
 }
 
 #[cfg(test)]

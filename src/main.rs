@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use std::num::NonZeroUsize;
 use hyper::header::{HOST, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -15,27 +14,9 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use hyper::body::Frame;
 use http_body_util::combinators::BoxBody;
 mod lru_cache;
-use lru_cache::LruCache;
-
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
-pub struct CacheKey  {
-    pub method: String,
-    pub host: String,
-    pub path: String,
-    pub query: Option<String>,
-}
-
-pub enum CacheMessage {
-    Get {
-        key: CacheKey,
-        reply_to: oneshot::Sender<Option<Bytes>>,
-    },
-    Put {
-        key: CacheKey,
-        value: Bytes,
-    },
-    EvictExpired,
-}
+use lru_cache::{CacheKey, CacheMessage, spawn_cache_actor, spawn_periodic_evictor};
+mod rate_limiter;
+use rate_limiter::{RateLimitMessage, spawn_rate_limiter};
 
 // Shared Client Type for Backend Forwarding via Connection Pool
 type HttpClient = Client<HttpConnector, hyper::body::Incoming>;
@@ -55,6 +36,7 @@ async fn proxy_handler(
     cache_tx: mpsc::Sender<CacheMessage>,
     client: HttpClient,
     client_ip: SocketAddr,
+    rate_limit_tx: mpsc::Sender<RateLimitMessage>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // responses > 10mb won't be cached 
     const MAX_CACHE_SIZE: usize = 10 * 1024 * 1024;
@@ -64,6 +46,29 @@ async fn proxy_handler(
         "proxy-authorization", "te", "trailers", 
         "transfer-encoding", "upgrade"
     ];
+
+    let (rl_tx, rl_rx) = oneshot::channel();
+
+    let _  = rate_limit_tx.send(RateLimitMessage::Allow {
+        ip: client_ip.ip(),
+        reply_to: rl_tx
+    }).await; 
+
+    if let Ok(permission) = rl_rx.await {
+        match permission {
+            false => {
+                let mut res = Response::new(
+                    Full::new(Bytes::from("429 Too many Requests\n"))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                );
+                *res.status_mut() = hyper::StatusCode::TOO_MANY_REQUESTS;
+                return Ok(res); 
+            }
+            true => {}
+        }
+    }
+
     let method = req.method().as_str().to_owned();
     let host = req.headers().get(HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string(); 
     let path = req.uri().path().to_owned();
@@ -212,46 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     println!("Reverse Proxy listening on http://{}", addr);
     // creates the channel to communicate with cache actor
-    let (cache_tx, mut cache_rx) = tokio::sync::mpsc::channel::<CacheMessage>(100);
+    let (cache_tx, cache_rx) = tokio::sync::mpsc::channel::<CacheMessage>(100);
 
-    // Spawn periodic evictor task
-    let cache_tx_evict = cache_tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let _ = cache_tx_evict.send(CacheMessage::EvictExpired).await;
-        }
-    });
-
-    // Spawn Cache Actor task
-    tokio::spawn(async move {
-        // Initialize the LRU Cache with a capacity
-        let capacity = NonZeroUsize::new(1000).unwrap();
-        let mut cache: LruCache<CacheKey, Bytes> = LruCache::new(capacity);
-        let default_ttl = Duration::from_secs(60);
-
-        while let Some(msg) = cache_rx.recv().await {
-            match msg {
-                CacheMessage::Get { key, reply_to } => {
-                    let mut cached_value = None;
-                    if let Some(val) = cache.get(&key) {
-                        cached_value = Some(val.clone());
-                    }
-                    let _ = reply_to.send(cached_value); 
-                }
-                CacheMessage::Put { key, value } => {
-                    cache.put(key, value, default_ttl);
-                }
-                CacheMessage::EvictExpired => {
-                    let count = cache.evict_expired();
-                    if count > 0 {
-                        println!("Evicted {} expired cache entries", count);
-                    }
-                }
-            }
-        }
-    });
+    spawn_periodic_evictor(cache_tx.clone());
+    spawn_cache_actor(cache_rx);
     // connection pooling(very imp since TLS handshakes are expensive)
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
@@ -262,17 +231,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .pool_max_idle_per_host(32)
         .build(connector); 
 
+    let rate_limit_tx = spawn_rate_limiter(30.0, 5.0);
+
     loop {
         let (stream, client_address) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let cache_tx_clone = cache_tx.clone();
         let client_clone = client.clone();
+        let rate_limit_tx_clone = rate_limit_tx.clone();
 
         // Spawn a tokio task to serve requests concurrently from this TCP stream (Keep-Alive)
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(io, service_fn(move |req| {
-                    proxy_handler(req, cache_tx_clone.clone(), client_clone.clone(),client_address)
+                    proxy_handler(req, cache_tx_clone.clone(), client_clone.clone(),client_address,rate_limit_tx_clone.clone())
                 }))
                 .await
             {
